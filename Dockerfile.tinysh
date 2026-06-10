@@ -1,0 +1,5 @@
+# Image minimale absolue : scratch + notre shell maison compilé en statique.
+# Prérequis : compiler ./sh d'abord (voir TUTORIAL.md étape 4).
+FROM scratch
+ADD sh /sh
+ENTRYPOINT ["/sh"]

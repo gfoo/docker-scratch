@@ -1,0 +1,6 @@
+# Binaires produits/extraits pendant le tuto — toujours regénérables
+busybox
+sh
+sh-glibc
+sh-musl
+*.o

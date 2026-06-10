@@ -1,0 +1,7 @@
+# Image minimale : scratch + un seul binaire statique (busybox).
+# Prérequis : récupérer ./busybox d'abord (voir TUTORIAL.md étape 3).
+FROM scratch
+ADD busybox /bin/busybox
+# Exec-form obligatoire : il n'y a pas de /bin/sh dans scratch pour la forme shell.
+RUN ["/bin/busybox", "--install", "/bin"]
+ENTRYPOINT ["/bin/busybox", "sh"]
