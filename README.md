@@ -6,7 +6,8 @@ de 23 ko contenant un shell écrit à la main.
 - **[DESIGN-LOG.md](DESIGN-LOG.md)** — le *pourquoi* : notes de la discussion
   exploratoire (Docker ≠ VM, bug Mongo 8 / kernel 7, `scratch`, tinysh).
 - **[TUTORIAL.md](TUTORIAL.md)** — le *comment* : tutoriel pas à pas reproductible,
-  avec les sorties mesurées.
+  avec les sorties mesurées. Passe par la case `chroot` (l'ancêtre de Docker) pour
+  montrer que Docker = `chroot` + namespaces + cgroups.
 
 ## Fichiers
 

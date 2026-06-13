@@ -6,15 +6,16 @@
 > (kernel `7.0.0-22-generic`, Docker 28.x, x86-64).
 >
 > **Fil rouge :** un conteneur n'a pas de kernel. On va le prouver, comprendre ce que
-> ça implique (le bug MongoDB 8 / kernel 7), puis construire le plus petit conteneur
-> possible : une image de **22,7 ko** contenant un shell écrit à la main en ~25 lignes de C.
+> ça implique (le bug MongoDB 8 / kernel 7), passer par la case `chroot` pour voir les
+> prémices de Docker, puis construire le plus petit conteneur possible : une image de
+> **22,7 ko** contenant un shell écrit à la main en ~25 lignes de C.
 
 ---
 
 ## Prérequis
 
 - Linux x86-64 avec Docker (ou Podman, mêmes commandes)
-- `gcc` pour l'étape 4 (le variant musl se fait *dans un conteneur*, rien à installer)
+- `gcc` pour l'étape 5 (le variant musl se fait *dans un conteneur*, rien à installer)
 - Les fichiers de ce repo : `tinysh.c`, `Dockerfile.busybox`, `Dockerfile.tinysh`
 
 ```bash
@@ -159,7 +160,109 @@ addgroup
 
 ---
 
-## Étape 4 — Écrire son propre « busybox » : un shell en ~25 lignes de C
+## Étape 4 — Le chaînon manquant : `chroot`, l'ancêtre de Docker
+
+*(éclaire le DESIGN-LOG §1 « namespaces + cgroups »)*
+
+Avant d'aller vers un binaire plus petit, faisons un détour historique qui démonte la
+mécanique de Docker. La toute première brique d'isolation sous Unix, c'est `chroot`
+(1979) : « à partir de maintenant, ta racine `/` c'est ce dossier ». Docker n'est, en
+première approximation, **qu'un `chroot` amélioré** auquel on a ajouté les *namespaces*
+et les *cgroups*. On va le voir littéralement.
+
+On réutilise le `busybox` extrait à l'étape 3 pour fabriquer un `rootfs` minimal (un
+faux « système » réduit à `/bin`), puis on `chroot` dedans.
+
+> **Note plateforme.** `chroot` exige root. Sur les Ubuntu récents (kernel 7 + AppArmor),
+> l'astuce « sans sudo » via `unshare -r` est bloquée
+> (`apparmor_restrict_unprivileged_userns=1`). Le plus simple et 100 % reproductible :
+> exécuter le `chroot` **dans un conteneur** — on y est root, et `CAP_SYS_CHROOT` fait
+> partie des capacités Docker par défaut. Joli clin d'œil : on chroote *dans* un
+> conteneur, soit l'ancêtre niché dans son descendant.
+
+### 4.1 Construire un rootfs et entrer dedans
+
+```bash
+# rootfs = busybox + quelques commandes en symlinks RELATIFS vers lui
+mkdir -p rootfs/bin && cp busybox rootfs/bin/busybox
+for c in sh ls cat echo uname id ps; do ln -s busybox rootfs/bin/$c; done
+
+docker run --rm -v "$PWD/rootfs":/rootfs:ro alpine sh -c '
+  echo "AVANT : racine du conteneur ="; ls / | tr "\n" " "; echo
+  chroot /rootfs /bin/sh -c "echo; echo APRES chroot : racine =; ls /; \
+      echo; echo qui suis-je : \$(id -un); echo kernel : \$(uname -r)"
+'
+```
+
+Résultat obtenu :
+
+```
+AVANT : racine du conteneur =
+bin dev etc home lib media mnt opt proc root rootfs run sbin srv sys tmp usr var
+
+APRES chroot : racine =
+bin
+qui suis-je : 0
+kernel : 7.0.0-22-generic
+```
+
+> ⚠️ Les symlinks doivent être **relatifs** (`sh -> busybox`). Un `busybox --install -s`
+> lancé depuis l'hôte crée des liens *absolus* (`/home/.../busybox`) qui deviennent
+> dangling une fois `/rootfs` devenu `/` → `chroot: can't execute '/bin/sh'`. Piège
+> rencontré pour de vrai en préparant ce tuto.
+
+Ce qu'on lit dans la sortie :
+
+- **La racine a changé** : avant, on voyait tout le FS d'Alpine ; après, on ne voit plus
+  que `bin` — le contenu de notre rootfs. C'est *exactement* ce que fait `FROM scratch`
+  + une image : restreindre l'arbre de fichiers visible.
+- **`qui suis-je : 0`** → on est **root**, le *même* root que dehors. `chroot` n'isole
+  **pas** l'identité utilisateur. Un root chrooté garde son pouvoir sur l'hôte (il peut
+  `mknod`, voir les autres process si `/proc` est monté, etc.). D'où le dicton :
+  « `chroot` n'est pas une frontière de sécurité ».
+- **kernel inchangé** → comme à l'étape 1, et comme partout : le kernel n'est jamais
+  isolé.
+
+### 4.2 Ce que `chroot` n'isole PAS — et que Docker, lui, isole
+
+Comparons le PID et le hostname entre un `chroot` et un vrai `docker run` :
+
+```bash
+# côté chroot : on hérite du PID namespace et du hostname du parent
+docker run --rm --hostname HOTE -v "$PWD/rootfs":/rootfs:ro alpine sh -c '
+  chroot /rootfs /bin/sh -c "echo chroot : PID=\$\$ , hostname=\$(hostname)"
+'
+# côté conteneur dédié : namespaces complets
+docker run --rm scratch-busybox -c 'echo docker : PID=$$ , hostname=$(hostname)'
+```
+
+```
+chroot : PID=8 , hostname=HOTE             ← process normal, hostname du parent
+docker : PID=1 , hostname=d78310b07578     ← son PID namespace + son UTS namespace
+```
+
+Tout est là :
+
+| | `chroot` | `docker run` |
+|---|----------|--------------|
+| Vue du système de fichiers (mount ns) | ✅ isolée | ✅ isolée |
+| PID (process visibles) | ❌ PID hérité (=8) | ✅ son init, **PID 1** |
+| Hostname (UTS ns) | ❌ celui du parent | ✅ le sien |
+| Réseau (net ns) | ❌ partagé | ✅ isolé |
+| Identité user (user ns) | ❌ root = root hôte | ✅ isolable |
+| Limites CPU/RAM (cgroups) | ❌ aucune | ✅ |
+| **Kernel** | partagé (hôte) | partagé (hôte) |
+
+> 💡 **Le résumé mental :** `chroot` = « tu ne vois que ce dossier ». Docker = « tu ne
+> vois que ce dossier, **que** tes process, **que** ton réseau, **que** ton hostname, et
+> tu ne dépasses pas X Mo de RAM ». Même idée de départ — confiner un process — mais
+> Docker empile toutes les clôtures que le kernel Linux a gagnées entre 1979 (chroot) et
+> ~2008 (namespaces + cgroups). Les deux, eux, partagent le kernel de l'hôte : le détour
+> par `chroot` rend physique l'affirmation centrale du design log.
+
+---
+
+## Étape 5 — Écrire son propre « busybox » : un shell en ~25 lignes de C
 
 *(DESIGN-LOG §7)*
 
@@ -186,7 +289,7 @@ Deux subtilités à bien comprendre dans le code :
   `write`) : il matérialise exactement la frontière userland↔kernel de l'étape 1.
   Bash fait pareil, plus ~100 000 lignes pour les pipes, jobs, variables, globbing.
 
-### 4.1 Compilation statique avec glibc
+### 5.1 Compilation statique avec glibc
 
 ```bash
 gcc -static -Os -o sh-glibc tinysh.c && strip sh-glibc
@@ -200,7 +303,7 @@ ls -lh sh-glibc
 775 ko pour 25 lignes ! La glibc statique embarque énormément de machinerie (locales,
 NSS, allocateur…). C'est le prix de `-static` avec glibc.
 
-### 4.2 Compilation statique avec musl — dans un conteneur
+### 5.2 Compilation statique avec musl — dans un conteneur
 
 Si `musl-gcc` n'est pas installé sur l'hôte, inutile de l'installer : on compile
 *dans un conteneur Alpine* (où gcc est nativement lié à musl) — c'est l'esprit même
@@ -222,7 +325,7 @@ ls -lh sh-glibc sh-musl
 
 ---
 
-## Étape 5 — L'image finale : `scratch` + tinysh = 22,7 ko
+## Étape 6 — L'image finale : `scratch` + tinysh = 22,7 ko
 
 `Dockerfile.tinysh` (fourni) :
 
@@ -243,7 +346,7 @@ ni `ls` ni `echo` à exécuter ! Deux expériences instructives :
 
 ```
 $ hello
-hello: No such file or directory   ← execvp a échoué → perror (cf. étape 4)
+hello: No such file or directory   ← execvp a échoué → perror (cf. étape 5)
 $ /sh
 $                                   ← un tinysh enfant lancé PAR tinysh : fork/exec marchent
 ```
@@ -263,7 +366,7 @@ $ $ $
 
 ---
 
-## Étape 6 — Bilan des tailles
+## Étape 7 — Bilan des tailles
 
 ```bash
 docker images | grep -E 'scratch-tinysh|scratch-busybox|alpine|busybox'
@@ -298,13 +401,18 @@ pistes : §7 fin du design log.
 
 1. **Conteneur = process cloisonné, pas mini-VM.** Namespaces + cgroups isolent le
    userland ; le kernel reste celui de l'hôte, partagé par tous.
-2. **La frontière de compatibilité est l'ABI syscall**, pas la libc (elle est figée
+2. **Docker = `chroot` + namespaces + cgroups.** `chroot` (1979) n'isole que la vue du
+   FS ; Docker ajoute les autres namespaces (PID, réseau, hostname, user) et les limites
+   de ressources. L'étape 4 le montre en direct : un `chroot` reste root sur l'hôte,
+   garde le PID et le hostname du parent — Docker, lui, donne un PID 1 et un hostname à
+   soi. Même idée de départ, clôtures en plus.
+3. **La frontière de compatibilité est l'ABI syscall**, pas la libc (elle est figée
    dans l'image). D'où des bugs du type Mongo 8 / kernel 7, qu'aucune image ne peut
    éviter — et qui se règlent côté hôte (changer de kernel) ou en remettant un kernel
    par conteneur (Kata, Firecracker, gVisor — DESIGN-LOG §4).
-3. **Une image n'est qu'un tas de fichiers.** `scratch` est le tas vide ; il suffit
+4. **Une image n'est qu'un tas de fichiers.** `scratch` est le tas vide ; il suffit
    d'un binaire statique pour avoir un conteneur fonctionnel de 23 ko.
-4. **Statique ou rien sur `scratch`** : pas de libc dans l'image → un binaire
+5. **Statique ou rien sur `scratch`** : pas de libc dans l'image → un binaire
    dynamique meurt avec `no such file or directory` avant même son `main`.
-5. **Un shell n'a rien de magique** : `read` → `fork` → `exec` → `wait`. Tout le
+6. **Un shell n'a rien de magique** : `read` → `fork` → `exec` → `wait`. Tout le
    reste (bash, zsh…) est du confort au-dessus de ces quatre syscalls.

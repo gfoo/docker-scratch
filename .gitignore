@@ -4,3 +4,5 @@ sh
 sh-glibc
 sh-musl
 *.o
+# rootfs construit à l'étape 4 (chroot)
+rootfs/
